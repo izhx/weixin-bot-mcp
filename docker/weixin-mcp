@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /app/.venv/bin/python /app/docker/runner.py "$@"

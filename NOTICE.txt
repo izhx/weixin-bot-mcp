@@ -1,0 +1,35 @@
+The original bridge implementation is MIT licensed; see LICENSE.
+This repository adapts cd233ljx/wechat-dot-bridge (2026-10-19 snapshot),
+retaining its code, tests, copyright and third-party notices.
+Owner-only proactive notifications and Docker deployment were added here.
+The proactive notification feature was informed by RerrentLinden/dots-wechat-bridge;
+its source code is not copied or required at runtime.
+Tencent/openclaw-weixin is the official protocol and binding-format reference,
+revision 24de5c9eb0dd5e595d7e2d090ed8a3f82870d42c. Its MIT notice is retained
+in licenses/Tencent-openclaw-weixin-MIT.txt. No OpenClaw runtime is required.
+cc-connect revision dfad19415a38b00b2c5c288610784d1a7eef337f was reviewed for
+the complete WeChat adapter and session lifecycle; adaptations are recorded in
+docs/UPSTREAM_AUDIT.md. dots-wechat-bridge was also examined during feasibility
+research. Neither project's source is vendored here or required at runtime.
+OpenAI tunnel-client is installed separately from its official release archive;
+the installed archive retains its own licenses and companion files.
+Media protocol and partial-quote handling are adapted from the Tencent reference
+above; the original MIT copyright notice is retained in licenses/.
+Runtime libraries are installed separately with their distribution notices:
+MCP Python SDK, AnyIO, jsonschema and Standard Webhooks (MIT),
+HTTPCore (BSD-3-Clause), cryptography (Apache-2.0 OR BSD-3-Clause),
+and Pillow (MIT-CMU). Locked versions are recorded in uv.lock.
+https://github.com/modelcontextprotocol/python-sdk
+https://github.com/agronholm/anyio
+https://github.com/python-jsonschema/jsonschema
+https://github.com/encode/httpcore
+https://github.com/standard-webhooks/standard-webhooks
+https://github.com/pyca/cryptography
+https://github.com/python-pillow/Pillow
+This project is independent and is not endorsed by OpenAI or Tencent.
+The Markdown filter in wechat_dot_bridge/codecs/markdown-filter.ts is copied
+unchanged from Tencent/openclaw-weixin revision 24de5c9eb0dd5e595d7e2d090ed8a3f82870d42c.
+The optional local audio helper uses silk-wasm 3.7.1 (MIT); its notice is in
+licenses/silk-wasm-MIT.txt. Node and imageio-ffmpeg/FFmpeg are installed separately,
+not bundled into this repository. FFmpeg builds have their own LGPL/GPL notices;
+redistribution must retain the build's license and source obligations.

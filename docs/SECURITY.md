@@ -1,0 +1,102 @@
+# 安全边界与恢复行为
+
+## 私有身份边界
+
+本桥接面向一个可信本机用户、一个微信 owner 和一个既有 dot。微信来信必须同时匹配已绑定 account、owner、私聊、完整消息；群聊、其他用户及机器人回声不入队。文字、引用、图片、文件、视频和语音按各自类型处理。
+
+现有生产 MCP 经官方 Secure MCP Tunnel 访问。可选 HTTPS/OAuth 入口仍为暂停接入的实验，监听与权限另见部署记录。Tunnel / 插件必须仅本人可访问；Tunnel 的组织和工作区关联需要按 [官方权限说明](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)核验。这里没有从共享 Tunnel 的每次请求中区分多个组织用户，所以**不能作为多用户服务分享给组织或团队**。
+
+一条有效订阅对应一个 callback 目的地。另一个目的地在原订阅仍有效时会收到 `subscription_conflict`；先在原 dot 取消订阅才能切换。该约束防止同时通知不同聊天，不能证明某个请求一定来自你期望的 dot；真正的访问授权来自私人 Tunnel / 插件权限。
+
+## 数据和凭据
+
+消息正文的业务去向是腾讯 iLink、当前用户的私人 SQLite，以及经私人 Tunnel 访问的 dot。Events 经本人订阅的签名回调携带普通文字（最多 16 KiB，超长时为有标记预览）、opaque message_id 和附件公开元数据，不含微信 owner、route、context token、登录 token、CDN URL 或解密 key。更长正文经 read_weixin_message 按 64 KiB 页提供给有权调用该插件的 dot；附件内容在显式读取或转发时才下载。
+
+| 数据 | 保存位置 / 对外行为 |
+| --- | --- |
+| 微信 token 与 context token | 私人 SQLite，仅收发模块使用 |
+| 来信与不可变回复 | 私人 SQLite；普通来信正文进入本人签名 Events，回复仅收发模块读取；完成并受理后清空正文 |
+| callback URL 与签名 secret | 私人订阅表；状态不返回完整 URL 或 secret |
+| Tunnel 运行密钥 | 操作者选定的私人文件，由官方 Tunnel client 读取 |
+| 待确认二维码 | 私人登录状态文件；确认或过期后清除状态文件中的二维码内容；可选本地 PNG 仍需操作者保管 |
+| 手机验证码 | 隐藏交互输入，不持久保存 |
+
+启用 `callback_proxy` 后，本机 HTTP 代理转发 Events 的端到端 HTTPS 连接，可以观察目标公网 IP、TLS 主机名等连接元数据，桥接不会向它发送明文 callback 路径、签名 secret 或事件 body。启用 `callback_dns: "google"` 后，Google Public DNS 仅收到回调 hostname 的 DNS 查询，不收到 callback URL / path、secret、消息 ID 或消息正文。微信绑定凭据不会进入 Events 请求；微信收发的网络路径不受这两个配置项影响。
+
+专用状态目录使用 `0700`，数据库、运行密钥和私人配置使用 `0600`。禁止用认证缓存作为配置输入，不扫描任何 agent 的认证目录。不要将运行目录、配置文件、数据库、二维码、密钥或 callback URL 放入 Git、聊天、工单附件或公开日志。SQLite 不是加密数据库；有本机同用户或管理员访问权的人可以读取它，备份必须继承相同保密边界。
+
+默认在任务完成且回复全部 accepted 后清空来信、回复分段、事件体及对应文字引用缓存；主动通知全部受理后也清空正文。保留必要 context、去重摘要、处理代次与发送回执；待处理、未受理和 uncertain 继续保留。附件回收不等于数据库总容量限制。显式开启历史清理时只移除符合条件的已完成记录，保留待处理 / 未确认发送、共享附件及 opaque hash 去重墓碑；墓碑不含正文或凭据但会继续增长。清理不等于安全擦除磁盘，也不移除旧备份中的内容。容量诊断、预览和备份轮换见 [维护说明](OPERATIONS.md)。
+
+Docker 部署支持用户自行编辑权限为 0600 的私有 `.env`：Compose 传入 `WEIXIN_TUNNEL_RUNTIME_KEY`，启动时校验并写入 `data/secrets/runtime.key`，Tunnel 配置仍只保存文件引用。启动进程在生成配置后不再把该 Key 环境变量继承给 Tunnel 子进程，但 Docker 容器环境配置仍可由有 Docker 管理权限的人查看；不要分享 `.env`、展开的 Compose 配置、inspect 或环境转储。`.env` 被 Git 与镜像构建上下文排除，仓库只提供不含秘密的 `.env.example`。也可继续使用 `sh scripts/manage.sh tunnel` 隐藏输入，或复用原有私有密钥文件；dotenv 空值保留旧值、非空值在下次启动时优先。上游源码 / systemd 参考使用拒绝管道与覆盖的 `scripts/save_runtime_key.py`。Bridge 不调用模型 API，但密钥仍可能具有其他权限，不能声称没有权限风险或用量成本。
+
+网络和协议错误只暴露固定类别。状态工具没有正文或秘密。需要注意，dot 工具读取结果与 dot 回复本身会进入你的 OpenAI 会话；私人 Tunnel 不会让正常产品级记录或会话存储消失。
+
+疑似凭据泄露、越权或目标校验漏洞使用 [私密报告流程](../SECURITY.md)，不要在公开工单中附配置、日志或数据库。
+
+## 出站请求校验
+
+微信请求限定在源码认可的腾讯 HTTPS origins；不接受调用者任意指定目标。Events callback 采用配置中的**精确 hostname**，先检查 allowlist，再执行 DNS 和连接：
+
+- 只允许 HTTPS 和 443；拒绝 userinfo、fragment、IP 字面量与通配符。
+- 每次请求重新解析 DNS；任何私有、本机、非公共或 IPv6 地址封装答案都拒绝，不能混合公共与私有答案。选择 Google DoH 也不跳过这些检查。
+- 系统解析最多接受 64 条 IPv4 / IPv6 候选，完整校验后才建立连接；不截断后忽略剩余地址。这样允许腾讯 CDN 返回 9 条 IPv4 加 9 条 IPv6，仍拒绝混入私网地址和超限回答。Google DoH 的响应大小与记录数量限制保持不变。
+- 直连 socket 或代理 `CONNECT` 都使用已经校验的公网 IP，不让代理再次解析回调 hostname；TLS 证书校验、SNI 和 HTTP `Host` 保留原 hostname。
+- 不跟随 HTTP redirect，不继承环境变量代理。不修改系统 DNS、环境代理或其他服务的网络配置。
+- DNS 与 HTTPS 请求有限时，请求 / 响应大小有限制。
+
+`callback_proxy` 未配置时 Events 直连；配置时只接受 `http://127.0.0.1:端口`，不接受远程代理、认证信息、路径、query 或其他 scheme。该代理必须由本人管理，桥接不会新建或修改代理服务。它与官方 Tunnel client 的控制面代理是两个独立配置。
+
+`callback_dns` 可选 `system`（默认）或 `google`。`system` 使用本机解析器；`google` 使用固定 `8.8.8.8:443`，TLS 核验 `dns.google`，通过 HTTPS 请求 Google Public DNS，避免先用本机 DNS 解析 DoH 服务。当启用 `callback_proxy` 时，DoH 也经该显式代理 `CONNECT 8.8.8.8:443`。解析或 TLS 失败时拒绝请求，不回退到未经校验的地址。
+
+`callback_hosts` 默认空数组。首次订阅会被拒绝，状态只保留观察到的 hostname。操作者应通过 OpenAI 的可信界面或官方来源独立确认后，配置准确主机名；**不要把任意被请求的 hostname 都批准，也不要开放 `*.openai.com` 或全域名通配**。本次现有 dot 返回的主机是 `connectors.api.openai.com`；[官方 MCP Events 文档](https://developers.openai.com/plugins/build/mcp-events)没有列出这一精确主机白名单。其核验依据是本人 dot 提供的订阅目标、OpenAI 主域层级、独立 DNS 查询和覆盖该主机的有效 TLS 证书；不是文档背书，也不能据此自动批准其他主机。
+
+激活订阅前发送短期随机 challenge，要求对方成功响应并 constant-time 回显；请求按 [MCP Events 官方要求](https://developers.openai.com/plugins/build/mcp-events)用 Standard Webhooks HMAC 签名。签名覆盖事件 ID、发送时间和确切 body 字节。签名 key 更新持久保存，并在短轮换窗口使用新旧双签名。事件不携带任何要求 dot 执行的用户指令；来信文本是用户数据。
+
+## 可靠性与重复限制
+
+入队、owner context 更新与微信 cursor 在同一 SQLite 事务提交，持久去重跨重启有效。待处理队列有容量上限；满队列失败不推进 cursor，不静默丢弃待处理消息。数据保存在本机，主机或数据库损坏仍需要你的私人备份和恢复策略。
+
+回复针对已有来信，同一来信可提交多条回复。默认相同正文重试返回原回复；不同正文创建追加回复。可用独立 `reply_key` 区分有意重复的相同正文，同一个 key 不可改写。`client_id` 按单条回复确定且持久保存，不能据此承诺腾讯网关提供 exactly-once 语义。
+
+| 状态 | 意义与操作 |
+| --- | --- |
+| `queued` | 本机已保存，尚未调用腾讯发送接口 |
+| `sending` | 正在发送；跨进程中断后保留不确定性 |
+| `accepted` | 腾讯 API 接受，未证明投递或已读 |
+| `uncertain` | 请求可能已到达，对其不自动重发；由本人核对微信结果 |
+| `context_required` | 没有可用 context，或被明确拒绝；等待本人新来信更新 context，恢复次数有限 |
+| `auth_required` | 绑定认证失效，暂停接收 / 发送；需要明确处理绑定 |
+| `failed` | 已知失败；查看固定错误类别，不把它当成功 |
+
+同绑定只有一个接收者。每个状态目录有 worker 锁；相同 account 还使用本机默认 lock directory 的共享锁。**它们不协调其他程序、其他系统用户或其他机器**。部署前必须停掉原 OpenClaw / cc-connect 接收服务；不要给不同实例配置不同 lock directory 来绕过锁。
+
+## 订阅失败和应用恢复
+
+callback 的 `2xx` 表示 webhook 收到，dot 异步处理不由该确认保证。瞬态失败有限次数指数退避；事件 ID 和 body 保持稳定，每次重签使用新时间。`410` 停止订阅，`413` 不重试。重试耗尽在安全状态中可见，worker 不会无限重置失败队列。
+
+订阅过期或取消会停止通知；微信来信仍可保存在待处理队列。相同订阅 identity 显式恢复时，尚未完成处理的来信可以重新通知，包括已发进度但未完成的任务；正常有效订阅刷新不会重发已确认的事件。不同 callback 的新订阅只自动接收其建立后入队的消息，旧消息通过 `list_pending_weixin_messages` 显式读取处理。
+
+协议始终返回 `cursor: null`，不实现历史 replay。上述恢复面向当前未完成处理，通知、处理轮次和微信发送相互独立；任务完成后不再自动通知。回复处于 `uncertain` 时仍需本人核对，重新订阅、重新读取或续期不会把不确定发送改回排队。合并处理必须显式指定本人已读取的来信，版本检查拒绝迟到轮次；普通进度不会复活完成任务。
+
+官方 MCP SDK 承担协议解析与 stdio，jsonschema 验证参数；SDK 日志、遥测和错误细节经过私人适配，网络层只暴露固定类别。HTTPCore 的统一 HTTP / CONNECT 实现仍由桥接限制为授权 hostname、公网 IP 固定、原主机 TLS、总体期限和响应上限，不继承环境代理，不启用发送重试。SDK 私有 stdin 隔离入口固定到锁定的 2.3 系列；升级须重验子进程 EOF、帧大小、取消及脱敏合约。
+
+## 报告问题
+
+报告版本、固定错误类别、脱敏状态、复现步骤与 fixture 即可。不要提供真实 token、运行密钥、签名 secret、callback 路径、二维码、完整数据库或私人正文。真人闭环未验收之前，不把该实现视为已验证可替换生产收信服务。
+
+## 媒体和分段
+
+附件引用及解密后的内容保存在同一个私人 SQLite 中。CDN 只允许腾讯 `novac2c.cdn.weixin.qq.com` 的 HTTPS `/c2c/download` 与 `/c2c/upload`，连接绑定已验证公网地址、TLS 核验原主机，无重定向，不发送微信 bearer token。AES-128-ECB / PKCS7 是腾讯媒体线协议要求，不是数据库加密。图片通过 Pillow 解码并生成预览，原始内容仍保留。
+
+当前单附件 20 MiB、暂存单次 1 MiB（支持分块累计至 20 MiB）、缓存 256 MiB、图片解码 2000 万像素。上述数值是实现资源预算，不代表腾讯产品限制。缓存预算不足会报告 media_cache_full；按部署策略清理过期且无待处理引用的附件缓存，保留消息元数据，不自动删除数据库或备份。需要更大媒体时须调整部署预算。
+
+文字回复单次工具调用最多 256 KiB，拆成不超过 3800 字符且 8192 UTF-8 字节的分段，每段独立持久确认。剩余分段不因前段成功而被标为成功；中断的不确定分段不自动重发。附件作为文字之后独立的媒体请求发送，不与说明文字合并在同一请求中。新增附件、上传进度、引用缓存、分段表属于前向兼容迁移；回滚前先停服，确认没有待发媒体或分段，否则旧代码无法正确处理新队列。
+
+媒体 CDN 网络单独支持 `media_proxy`（仅本人本机 `http://127.0.0.1:端口`）及 `media_dns`（system / google），默认直连及系统 DNS。仅在本机 DNS 或直连不可用时配置；同样保留精确腾讯主机、公共 IP 固定连接、TLS 域名核验和无重定向。DoH 只接收 CDN 主机名，不接收媒体 URL 参数或 AES 密钥；本机代理转发端到端 HTTPS。它不修改全局代理、微信 API 或 Events 回调设置。
+
+
+## HTTPS 文件导入与运维提示
+
+import_weixin_attachment 可下载工具调用者明确提供的公开 HTTPS 文件，最多 20 MiB。每次跳转重新校验 HTTPS、端口与公网地址并固定连接目标；不接受登录凭据、不转发授权头或 Cookie、不读取服务器路径和 sandbox 路径。下载 URL 及其签名参数不写入数据库、日志或工具结果。文件内容进入原私有附件库。此能力的目的地由明确的文件导入请求决定，与 Events 的固定回调主机白名单分开。
+
+运行诊断只记录安全 ID、固定错误类别和时间。桥接状态提示通过独立 is_notice 标记持久化，不将其视为 dot 已处理来信；每条已有来信最多一次，且不对未知发送结果自动重放。恢复副本默认关闭收发，不自动启用第二个接收实例。

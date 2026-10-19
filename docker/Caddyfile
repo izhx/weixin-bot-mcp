@@ -1,0 +1,85 @@
+{
+	admin off
+	# IP clients may omit TLS SNI. Select the managed IP certificate explicitly.
+	default_sni {$MCP_PUBLIC_HOST}
+	http_port 8080
+	https_port 8443
+	auto_https disable_redirects
+	log default {
+		output discard
+	}
+	servers {
+		protocols h1 h2
+	}
+}
+(mcp_upstream) {
+	reverse_proxy {$MCP_BACKEND_HOST:172.17.0.1}:8789 {
+		header_up Host {$MCP_PUBLIC_HOST}
+	}
+}
+https://{$MCP_PUBLIC_HOST} {
+	tls {
+		issuer acme {
+			dir https://acme-v02.api.letsencrypt.org/directory
+			profile shortlived
+			disable_tlsalpn_challenge
+		}
+	}
+	# Only fixed route labels and response timing/status enter this private log.
+	# Entire requests and response headers are removed before JSON is written.
+	log {
+		output file /data/mcp-discovery-access.jsonl {
+			mode 0600
+			roll_size 1MiB
+			roll_keep 1
+			roll_keep_for 24h
+		}
+		format filter {
+			wrap json
+			fields {
+				request delete
+				resp_headers delete
+				user_id delete
+				bytes_read delete
+				size delete
+			}
+		}
+	}
+	# Discovery must not depend on clients following a 307 or choosing only
+	# the resource-specific spelling advertised by WWW-Authenticate.
+	@oauth_metadata path /.well-known/oauth-authorization-server /.well-known/oauth-authorization-server/
+	handle @oauth_metadata {
+		log_append route oauth_metadata
+		header >Cache-Control no-store
+		rewrite * /.well-known/oauth-authorization-server
+		import mcp_upstream
+	}
+	@resource_metadata path /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/ /.well-known/oauth-protected-resource/mcp /.well-known/oauth-protected-resource/mcp/
+	handle @resource_metadata {
+		log_append route resource_metadata
+		header >Cache-Control no-store
+		rewrite * /.well-known/oauth-protected-resource/mcp
+		import mcp_upstream
+	}
+	handle /register {
+		log_append route registration
+		import mcp_upstream
+	}
+	handle /mcp {
+		log_append route mcp
+		import mcp_upstream
+	}
+	@owner_auth path /authorize /token /revoke /owner-login
+	handle @owner_auth {
+		log_skip
+		import mcp_upstream
+	}
+	handle /probe {
+		log_skip
+		respond "weixin-mcp-https-ready" 200
+	}
+	handle {
+		log_skip
+		respond 404
+	}
+}

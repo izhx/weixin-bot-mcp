@@ -1,0 +1,157 @@
+# 运行、诊断和恢复
+
+以下命令中的配置路径属于部署者自己的安装，示例使用 `CONFIG` 占位。不要输出配置全文、原始网络日志或数据库内容。
+
+## 日常检查（服务运行期间可用）
+
+```bash
+wechat-dot-bridge --config CONFIG status
+wechat-dot-bridge --config CONFIG diagnose
+wechat-dot-bridge --config CONFIG storage
+wechat-dot-bridge --config CONFIG subscriptions
+wechat-dot-bridge --config CONFIG queue
+```
+
+`diagnose` 返回消息 ID、固定错误类别和等待时长，并报告容量告警。`storage` 只返回数据库 / 附件字节、可复用空间、磁盘可用字节、各表计数与固定告警，不含路径、正文、绑定、回调 URL 或密钥。`subscriptions` 返回不含回调地址和密钥的订阅 ID、状态与期限。`queue` 返回尚未解决的回复 ID，不含正文。
+
+来信超过五分钟未处理、且 dot 没有报告有效处理进度时，仅在诊断中记录等待状态，不自动发送微信提示：桥接无法观察 dot 的完整运行生命周期，等待或进度租期到期不能证明任务失败。已明确失败的回复仍可触发一次“桥接状态”提示；`rate_limited` 不追加通知，`uncertain` 不自动提醒或重发。一条来信最多一次提示，跨重启去重；每轮最多入队一条。不清空待处理来信，也不因另一条来信收到回复就把旧文件任务标为完成。
+
+处理状态独立持久化：已提交或已发送 `final:false` 进度的任务仍在待处理列表；最终回复或显式 `completed:true` 才终结处理轮次。daemon 重启将活跃轮次保留为可恢复中断，发送中断仍保留 `uncertain`。状态查询不重新认领任务、不启动输入提示、不发送回复。合并处理多条来信时只完成显式关联且已读取的消息。
+
+若微信绑定不可用、回复上下文已失效或整个服务没运行，微信提示本身也可能无法送达，此时必须使用本机检查。平台任务是否启用仍须在原 dot 检查；不能由 acknowledged 推断模型已经执行。
+
+## 修改状态（先停止唯一服务）
+
+```bash
+systemctl --user stop wechat-dot-bridge.service
+wechat-dot-bridge --config CONFIG backup /PRIVATE/NEW-snapshot.sqlite3
+wechat-dot-bridge --config CONFIG cancel-subscription SUBSCRIPTION_ID
+# 或：
+wechat-dot-bridge --config CONFIG subscription-forever
+wechat-dot-bridge --config CONFIG retry-send REPLY_ID
+wechat-dot-bridge --config CONFIG retry-attachment ATTACHMENT_ID
+systemctl --user start wechat-dot-bridge.service
+```
+
+按实际需要选择命令，不要逐行执行整个示例。修改命令取得 worker 锁；服务仍在运行时会拒绝，不会启动第二个收信服务。取消订阅仅清理所选订阅及其待投递通知，不清空微信绑定、来信、回复或附件。
+
+`uncertain` 表示服务器无法确定一次发送是否已经到达。核对微信里**当前不确定的那一段**后，使用：
+
+```bash
+wechat-dot-bridge --config CONFIG resolve-send REPLY_ID --outcome delivered
+# 确认没收到才用：
+wechat-dot-bridge --config CONFIG resolve-send REPLY_ID --outcome not-delivered
+```
+
+`delivered` 仅确认当前未确认分段，后续未发送段继续排队；不把整条长文误判完成。`not-delivered` 允许重试该段。这个人工决定不开放给 dot 自动猜测。
+
+## 升级与回滚
+
+1. 在独立 checkout / worktree 执行 `uv sync --locked --all-extras`，运行 Ruff 与完整发布检查；验证新库迁移和 SDK / 网络合约。
+2. 停止唯一服务，保存私有新备份，记录旧 commit。
+3. 快进生产源码；在同一源码目录执行 `uv sync --locked --all-extras`，让包装器使用锁定的 `.venv`。不执行部署期 `uv lock`，不升级全局 Python/Node；可选编解码器沿用独立专用目录。
+4. 启动原服务，核对绑定、订阅数量、不过期策略与队列；用微信验证。
+5. 优先前向修复。需要回滚时先停服务，在新恢复目录使用与旧 commit 兼容的升级前快照，保留升级后原库并人工核对新来信与发送结果；不要让旧代码直接打开已升级的生产库，也不要用旧快照覆盖升级后收到的消息。旧版可能不理解 `is_notice`、媒体 / 分段或去重墓碑语义，不能仅凭“新增表 / 列”判定可直接回退。
+
+启动时 `migrations.py` 使用 `PRAGMA user_version` 记录数据库版本。所有尚未应用的迁移和版本标记在一个事务提交；故障或进程中断回滚，重启从上次已提交版本恢复。未版本化旧库在首次迁移补齐旧回填。高于当前支持范围的版本会以 `database_schema_unsupported` 拒绝打开；遇到该类别保留数据库并使用兼容版本，不能修改版本号绕过检查。
+
+停机取消或未完成 claim 中断后，Events 通知和入站附件下载恢复为待重试，并退回该次未完成 claim 的次数；已确认的超时或服务端临时错误仍受原重试上限约束。Events 恢复沿用同一事件 ID 和内容。微信发送中断保留 `uncertain`，这项恢复不适用于微信消息自动重发。旧版已经写成 `failed` 的记录不能据此自动推断为停机中断。
+
+仓库提供 `uv run --locked --all-extras python scripts/verify-upgrade.py`，在临时目录用固定旧结构和模拟数据验证升级、已发送分段、不确定状态及备份恢复；不依赖旧 Git 历史，不连接微信和真实数据库。需要验证某个实际旧版本时，追加 `--old-revision` 和本地可用的 commit / tag。旧版未保存每条回复的 `final`，迁移只依据保留下来的处理租期等明确证据恢复未完成状态，不推断隐藏的 dot 执行记录，不改变发送结果。
+
+## 从备份恢复到新目录
+
+```bash
+wechat-dot-bridge --state-dir /PRIVATE/EMPTY-RECOVERY restore-backup /PRIVATE/snapshot.sqlite3
+wechat-dot-bridge --state-dir /PRIVATE/EMPTY-RECOVERY diagnose
+wechat-dot-bridge --state-dir /PRIVATE/EMPTY-RECOVERY queue
+```
+
+目标必须没有数据库；工具拒绝覆盖现有库或符号链接，备份必须仅本人可读。恢复副本的微信收发默认暂停，保留绑定、订阅与历史。先确认原接收服务停止，解决发送不确定状态，再把部署配置指向恢复目录并显式恢复收发。不要同时运行原库与恢复库。
+
+## 容量与保留策略
+
+0.2.4 默认每秒检查一次正文清理。任务状态为 completed 且整个处理组的回复全部 accepted 后，自动清空来信、回复及分段正文、对应事件体和文字引用缓存；无回复但明确 completed=true 的任务也会清理。发送与回调结束会唤醒维护，无须等每小时历史清理。主动通知全部分段 accepted 后同样清理正文。
+
+待处理、仍在发送、发送失败、待刷新 context/登录或 uncertain 的内容继续保留；正在发送的回调先完成，待重试回调在已完成任务上取消后清空，避免重试签名载荷被提前修改。保留 opaque ID、去重摘要、context、处理代次、分段受理状态和脱敏时间线，重复提交不会再次发送。读取清理后的来信返回 text_cleared:true，正文为空；旧文字引用可能返回 content_cleared。附件仍按独立七天/256 MiB 缓存策略管理，本轮没有立即删除已完成附件。
+
+此机制清理当前数据库中的正文，既有私人备份不会被修改，也不承诺对磁盘、WAL 或备份做安全擦除。history_days 只控制更老状态记录的退休，不影响上述正文清理。附件预算不是整个数据库的容量上限。`storage` 的 `database_bytes` 包括 SQLite 主文件及现存 journal / WAL / SHM，`database_reusable_bytes` 是可被后续写入复用的页；删除记录不会保证文件立即缩小或释放同等磁盘空间。私人备份另占空间，不包含在这个数据库计数中。
+
+`maintenance_policy` 在私人 `bridge.json` 中可选配置；下例表示保留符合清理条件的已完成历史至少 30 天：
+
+```json
+{
+  "maintenance_policy": {
+    "history_days": 30,
+    "disk_warning_mib": 512,
+    "database_warning_mib": 1024
+  }
+}
+```
+
+| 参数 | 默认与含义 |
+| --- | --- |
+| `history_days` | `0`，关闭自动消息历史清理；可设 `1`–`3650` 天 |
+| `disk_warning_mib` | `512`，可用磁盘低于阈值返回 `disk_space_low` |
+| `database_warning_mib` | `1024`，数据库字节大于阈值返回 `database_large` |
+
+告警不停止收发，不是数据库硬上限。配置变更先停服并备份，重启后 `storage` 核对策略。服务每小时执行附件维护；`history_days > 0` 时同时分批清理已完成历史。
+
+手动操作先停止唯一服务并保存私人备份。默认只预览，追加 `--apply` 才执行；`--days` 覆盖本次天数，不改配置：
+
+```bash
+wechat-dot-bridge --config CONFIG cleanup-history --days 30
+wechat-dot-bridge --config CONFIG cleanup-history --days 30 --apply
+wechat-dot-bridge --config CONFIG storage
+```
+
+每轮最多处理 500 条。只选择超龄且所有回复已 `accepted` 的已完成来信；近期回复 / 时间线、待处理、非 `accepted`（包括 `uncertain` / 失败）发送、活跃进度、待投递事件、共享附件、最新 context 和最高消息 rowid 均保留。清理移除对应正文 / 历史及可删除附件，保留不含正文或凭据的 opaque hash 去重墓碑，旧微信消息不会重新入队。引用缓存可能返回 `cache_expired`；不能从被清理记录恢复旧内容。
+
+去重墓碑会随历史消息继续少量增长；保留条件也可能使某些很旧记录无法删除，不能承诺绝对容量上限。清理不删除旧私人备份中的内容，也不等于安全擦除 SQLite / 磁盘上历史字节。备份及磁盘预算仍由部署者管理。
+
+## 私人备份轮换
+
+单次 `backup /PRIVATE/NEW-snapshot.sqlite3` 保留原有手工快照行为。希望轮换时使用专用 `0700` 目录，先停服务：
+
+```bash
+wechat-dot-bridge --config CONFIG backup-managed /PRIVATE/bridge-backups --keep 7
+```
+
+先生成并校验新的 `0600` SQLite 快照，成功后才保留最新 7 份并移除多余的本工具 `bridge-backup-*.sqlite3` 文件；失败不轮换旧备份。其他命名的手工备份（例如 `before-*`）保留，不在专用目录存放其他恰好匹配本工具命名的文件。拒绝符号链接、不安全权限或硬链接文件，结果只报告完整性、保留 / 移除计数，不输出快照路径或内容。
+
+备份不会自动定时创建。恢复时由操作者在私人目录选定快照，并使用上面的 `restore-backup` 流程；生产与恢复实例不能同时收信。
+
+## 分段延迟测量
+
+`wechat-dot-bridge --config CONFIG latency --limit 10` 或追加
+`--message-id MESSAGE_ID`，只输出关联 ID、时间和状态，不输出正文、凭据或回调 URL。
+记录长轮询返回、事件排队/投递/每次回调结果、成功读工具开始/结束、
+回复入队、发送 worker 开始及首次微信接口受理。工具处理时间使用单调时钟；
+阶段时间使用本机时钟。微信消息创建时间来自另一时钟，不用于本地阶段差值。
+事件到 ACK 包含重试等待，单次回调耗时见 timeline.elapsed_ms。
+发送 worker 开始到受理可能包含媒体上传；首次受理不代表所有分段送达。
+工具处理时间不包含平台调度、Tunnel 传输或客户端渲染。
+旧消息缺失阶段为 null，不反推或伪造时间。读工具关键时间另存 timeline，
+不受最近 1000 条工具诊断记录轮换影响。
+
+读取请求新增两个派发阶段，用于把读前等待拆开：`callback_to_dispatch` 表示通知 ACK
+到 SDK 收到并验证读请求的时间，包含平台调度、Tunnel 和 SDK 入站处理；
+`dispatch_to_read_thread` 用单调时钟记录该请求等待 AnyIO 工作线程的时间。
+旧记录没有派发观测时保持 null，不能由 `callback_to_read` 直接断言所有时间都属于模型。
+
+新来信成功入库后即尝试显示输入提示，等待 dot 时也显示，等待期限为五分钟。
+这是进程内的等候提示，不把消息标成已读取或处理中；dot 实际读取后接续持久处理租期。
+重复来信不续期，服务重启不为历史消息恢复等候提示。完成、停止、暂停或到期后取消；
+同一会话还有有效等待或处理时继续显示。刷新网络失败仍可能造成间断，状态中的
+ticket / start / stop 固定结果计数用于定位接口失败；成功调用不保证手机端显示。
+`waiting_leases` 记录等候候选数；`waiting_history_skipped` 计数表示创建时间早于启动前
+两秒的历史候选被排除，不输出消息 ID 或时间原值。创建时间判断依赖主机校时。
+
+正常 getupdates 响应读取截止保持 cursor 并继续轮询；DNS、连接、TLS、协议和认证错误
+仍按故障处理。入站提交、附件就绪、读取及回复入队会唤醒对应 worker，周期检查继续兜底；
+发送仍只有一个 worker，唤醒不绕过限流或分段节奏，也不重试 `uncertain`。
+
+先连续测三条纯文字，每条收到回复再发下一条；比较 receive_to_event、
+callback_to_read、read_server、reply_tool_server、queue_to_send 等阶段。
+派发计时本身只增加观测，唤醒和轮询调整见上文。回滚遵循上面的兼容副本流程，
+保留原库和升级后消息，不用旧快照覆盖生产数据。

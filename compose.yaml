@@ -1,0 +1,102 @@
+name: weixin-bot-mcp
+services:
+  bridge:
+    image: weixin-bot-mcp:0.2.4
+    build:
+      context: .
+      target: final
+      network: host
+      args:
+        HTTP_PROXY: ${BUILD_HTTP_PROXY:-}
+        HTTPS_PROXY: ${BUILD_HTTP_PROXY:-}
+    user: "${RUN_UID:-1000}:${RUN_GID:-1000}"
+    init: true
+    network_mode: host
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 96
+    restart: unless-stopped
+    stop_grace_period: 45s
+    environment:
+      TZ: Asia/Shanghai
+      WEIXIN_TUNNEL_ID: ${WEIXIN_TUNNEL_ID:-}
+      WEIXIN_TUNNEL_RUNTIME_KEY: ${WEIXIN_TUNNEL_RUNTIME_KEY:-}
+      WEIXIN_TUNNEL_PROXY: ${WEIXIN_TUNNEL_PROXY:-}
+      WEIXIN_CALLBACK_PROXY: ${WEIXIN_CALLBACK_PROXY:-}
+      WEIXIN_CALLBACK_DNS: ${WEIXIN_CALLBACK_DNS:-}
+      WEIXIN_MEDIA_PROXY: ${WEIXIN_MEDIA_PROXY:-}
+      WEIXIN_MEDIA_DNS: ${WEIXIN_MEDIA_DNS:-}
+    healthcheck:
+      test: [CMD, /app/.venv/bin/python, /app/docker/runner.py, healthcheck]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
+  test:
+    profiles: [test]
+    image: weixin-bot-mcp-test:0.2.4
+    build:
+      context: .
+      target: test
+      network: host
+      args:
+        HTTP_PROXY: ${BUILD_HTTP_PROXY:-}
+        HTTPS_PROXY: ${BUILD_HTTP_PROXY:-}
+    user: "${RUN_UID:-1000}:${RUN_GID:-1000}"
+    init: true
+    network_mode: host
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=2g
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 128
+    command: [test]
+  https:
+    profiles: [url]
+    container_name: weixin-mcp-https
+    image: caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
+    pull_policy: never
+    entrypoint: [caddy]
+    command: [run, --config, /etc/caddy/Caddyfile, --adapter, caddyfile]
+    user: "${RUN_UID:-1000}:${RUN_GID:-1000}"
+    environment:
+      # Documentation-only example; set MCP_PUBLIC_HOST for your deployment.
+      MCP_PUBLIC_HOST: ${MCP_PUBLIC_HOST:-203.0.113.10}
+      MCP_BACKEND_HOST: ${MCP_BACKEND_HOST:-172.17.0.1}
+    ports:
+      - "80:8080"
+      - "443:8443"
+    volumes:
+      - ./data/config/https-Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/tls:/data
+      - ./data/tls-config:/config
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: 5m
+        max-file: "2"

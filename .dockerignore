@@ -1,0 +1,16 @@
+.git
+.venv
+__pycache__
+**/__pycache__
+data
+runtime
+state
+secrets
+.env*
+*.sqlite*
+*.key
+*.pem
+*.log
+.cache/*
+!.cache/tunnel
+!.cache/tunnel/**
